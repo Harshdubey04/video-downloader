@@ -8,10 +8,13 @@ type Format = {
   container: string;
   resolution: string | null;
   filesize_bytes: number | null;
+  filesize_is_approximate?: boolean;
+  filesize_source?: "exact" | "approximate" | "estimated" | null;
   has_audio: boolean;
   video_codec?: string | null;
   audio_codec?: string | null;
   has_video?: boolean;
+  kind?: "video+audio" | "video" | "audio";
   needs_merge?: boolean;
 };
 
@@ -47,10 +50,17 @@ function formatDuration(seconds: number | null) {
   return `${minutes}:${String(Math.floor(seconds % 60)).padStart(2, "0")}`;
 }
 
-function formatSize(bytes: number | null | undefined) {
-  if (bytes === null) return "Size unavailable";
-  if (!bytes) return "Size unavailable";
-  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+function formatSize(bytes: number | null | undefined, approximate = false) {
+  if (!bytes || bytes <= 0) return "Size unavailable";
+  const units = ["KB", "MB", "GB"];
+  let value = bytes / 1024;
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  const precision = value >= 100 ? 0 : value >= 10 ? 1 : 2;
+  return `${value.toFixed(precision)} ${units[unitIndex]}${approximate ? " (estimate)" : ""}`;
 }
 
 function formatSpeed(bytes: number | null) {
@@ -61,6 +71,11 @@ function formatSpeed(bytes: number | null) {
 function formatEta(seconds: number | null) {
   if (!seconds) return "";
   return `${Math.ceil(seconds)}s remaining`;
+}
+
+function formatLabel(format: Format) {
+  const mediaKind = format.kind === "audio" ? "audio only" : format.kind === "video" ? "video · FFmpeg merge" : "video + audio";
+  return `${format.container.toUpperCase()} · ${format.resolution ?? "Original"} · ${mediaKind} · ${formatSize(format.filesize_bytes, format.filesize_is_approximate)}`;
 }
 
 export default function Home() {
@@ -170,7 +185,7 @@ export default function Home() {
           <div className="section-label"><Check size={16} /> Analysis complete</div>
           <div className="result-grid">
             <div className="preview">{analysis.thumbnail_url ? <div className="preview-image" aria-label="Video thumbnail" role="img" style={{ backgroundImage: `url("${analysis.thumbnail_url}")` }} /> : <div className="preview-icon"><FileVideo size={38} /></div>}<div><span className="source-tag">{analysis.source}</span><h2>{analysis.title ?? "Untitled video"}</h2><p><Clock3 size={15} /> {formatDuration(analysis.duration_seconds)}</p></div></div>
-            <div className="format-panel"><label htmlFor="format">Choose a format</label><select id="format" value={selected} onChange={(event) => setSelected(event.target.value)}>{analysis.formats.map((format) => <option key={format.format_id} value={format.format_id}>{format.container.toUpperCase()} · {format.resolution ?? "Original"} · {formatSize(format.filesize_bytes)}{format.has_audio ? "" : " · audio merge required"}</option>)}</select><button className="download-button" onClick={startDownload} disabled={!selected || !analysis.download_supported || Boolean(job && ["queued", "downloading", "processing"].includes(job.status))}><ArrowDownToLine size={18} /> {job && ["queued", "downloading", "processing"].includes(job.status) ? "Downloading..." : "Download selected format"}</button>{analysis.drm_status === "detected" && <p className="notice"><TriangleAlert size={15} /> DRM-protected media requires an official provider workflow.</p>}</div>
+            <div className="format-panel"><label htmlFor="format">Choose a format</label><select id="format" value={selected} onChange={(event) => setSelected(event.target.value)}>{analysis.formats.map((format) => <option key={format.format_id} value={format.format_id}>{formatLabel(format)}</option>)}</select><button className="download-button" onClick={startDownload} disabled={!selected || !analysis.download_supported || Boolean(job && ["queued", "downloading", "processing"].includes(job.status))}><ArrowDownToLine size={18} /> {job && ["queued", "downloading", "processing"].includes(job.status) ? "Downloading..." : "Download selected format"}</button>{analysis.drm_status === "detected" && <p className="notice"><TriangleAlert size={15} /> DRM-protected media requires an official provider workflow.</p>}</div>
           </div>
         </section>
       )}
@@ -183,7 +198,7 @@ export default function Home() {
       </section>}
 
       <section className="feature-section shell" id="how-it-works"><div className="section-heading"><span className="kicker">Made for the web</span><h2>A better way to save what matters.</h2><p>Clear information, no guesswork. Fetchly only offers formats reported by the source.</p></div><div className="feature-grid"><article><div className="feature-icon purple"><FileVideo size={21} /></div><h3>See before you save</h3><p>Review resolution, codecs, audio, duration, and approximate size before choosing a format.</p></article><article><div className="feature-icon peach"><ShieldCheck size={21} /></div><h3>Built with boundaries</h3><p>Private destinations, DRM content, and unsupported sources are blocked rather than silently attempted.</p></article><article><div className="feature-icon mint"><Clock3 size={21} /></div><h3>Links that expire</h3><p>Completed files are temporary and securely served through short-lived download links.</p></article></div></section>
-      <section className="supported shell" id="supported"><div><span className="kicker">Supported sources</span><h2>Start with a direct media URL</h2><p>Fetchly supports direct MP4 and WebM media and carefully selected public extractors. Source support can change; the analyzer always has the final say.</p></div><div className="source-list"><span>MP4</span><span>WebM</span><span>Authorized public media</span></div></section>
+      <section className="supported shell" id="supported"><div><span className="kicker">Supported sources</span><h2>Paste a video page or direct media URL</h2><p>Fetchly uses yt-dlp for compatible public platforms, including YouTube, Vimeo, TikTok, Instagram, Facebook, XHamster, and XVideos. Support varies by URL and website changes.</p></div><div className="source-list"><span>YouTube</span><span>Vimeo</span><span>XHamster</span><span>XVideos</span><span>MP4 / WebM</span></div></section>
       <footer className="footer shell" id="privacy"><span className="brand">fetchly</span><span>For content you own or are authorized to download.</span><span>Privacy · Terms · Contact</span></footer>
     </main>
   );

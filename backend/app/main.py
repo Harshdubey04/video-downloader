@@ -48,6 +48,37 @@ class JobCancelled(Exception):
     pass
 
 
+def extractor_error_message(error: Exception) -> str:
+    message = str(error).lower()
+    if any(term in message for term in ("drm", "protected", "encrypted")):
+        return "This media is protected and cannot be downloaded by Fetchly."
+    if any(term in message for term in ("login required", "sign in", "authentication", "private video")):
+        return "This media requires authentication. Fetchly cannot access login-only content."
+    if any(term in message for term in ("rate limit", "too many requests", "429")):
+        return "The source is rate limiting requests. Wait and try again later."
+    if any(term in message for term in ("geo-restricted", "not available in your country", "country")):
+        return "This media is unavailable in your region."
+    if any(term in message for term in ("unsupported url", "no suitable extractor", "not a valid url")):
+        return "This URL is not supported by the installed yt-dlp extractors."
+    if any(term in message for term in ("timed out", "timeout", "temporary failure", "network is unreachable", "connection reset", "connection aborted", "unable to download webpage")):
+        return "The source could not be reached reliably. Check your connection and try again."
+    return "The source could not be processed. It may be unavailable, restricted, or unsupported."
+
+
+def validate_extracted_urls(info: dict[str, Any]) -> None:
+    resolved_urls: list[str] = []
+    for item in info.get("formats", []):
+        if item.get("url"):
+            resolved_urls.append(item["url"])
+    for item in info.get("requested_formats", []):
+        if item.get("url"):
+            resolved_urls.append(item["url"])
+    if info.get("url"):
+        resolved_urls.append(info["url"])
+    for resolved_url in resolved_urls:
+        public_hostname(resolved_url)
+
+
 def now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -74,7 +105,7 @@ def direct_format(url: str) -> dict[str, Any] | None:
     extension = Path(urlparse(url).path).suffix.lower().lstrip(".")
     if extension not in {"mp4", "webm", "m4v", "mov"}:
         return None
-    return {"format_id": f"direct-{extension}", "container": "webm" if extension == "webm" else "mp4", "resolution": None, "width": None, "height": None, "filesize_bytes": None, "has_audio": True, "video_codec": None, "audio_codec": None, "needs_merge": False}
+    return {"format_id": f"direct-{extension}", "container": "webm" if extension == "webm" else "mp4", "resolution": None, "width": None, "height": None, "filesize_bytes": None, "filesize_is_approximate": False, "filesize_source": None, "has_audio": True, "has_video": True, "kind": "video+audio", "video_codec": None, "audio_codec": None, "needs_merge": False}
 
 
 def is_direct(url: str) -> bool:
@@ -105,19 +136,60 @@ def update_job(job_id: str, **updates: Any) -> None:
             jobs[job_id].update(updates)
 
 
-def format_info(item: dict[str, Any]) -> dict[str, Any]:
+def positive_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def estimate_filesize(item: dict[str, Any], duration_seconds: Any) -> int | None:
+    duration = positive_number(duration_seconds)
+    if not duration:
+        return None
+    bitrate = positive_number(item.get("tbr"))
+    if bitrate is None:
+        video_bitrate = positive_number(item.get("vbr")) or 0
+        audio_bitrate = positive_number(item.get("abr")) or 0
+        bitrate = video_bitrate + audio_bitrate or None
+    if bitrate is None:
+        return None
+    return round(duration * bitrate * 1000 / 8)
+
+
+def format_info(item: dict[str, Any], duration_seconds: Any = None) -> dict[str, Any]:
     width = item.get("width")
     height = item.get("height")
     extension = item.get("ext") or "unknown"
+    has_audio = item.get("acodec") not in {None, "none"}
+    has_video = item.get("vcodec") not in {None, "none"}
+    exact_size = positive_number(item.get("filesize"))
+    approximate_size = positive_number(item.get("filesize_approx"))
+    estimated_size = estimate_filesize(item, duration_seconds)
+    if exact_size is not None:
+        filesize_bytes = round(exact_size)
+        filesize_source = "exact"
+    elif approximate_size is not None:
+        filesize_bytes = round(approximate_size)
+        filesize_source = "approximate"
+    else:
+        filesize_bytes = estimated_size
+        filesize_source = "estimated" if estimated_size is not None else None
     return {
         "format_id": str(item.get("format_id", "")),
         "container": extension,
         "resolution": f"{width}x{height}" if width and height else (item.get("resolution") or "audio only" if item.get("vcodec") == "none" else "Original"),
         "width": width,
         "height": height,
-        "filesize_bytes": item.get("filesize") or item.get("filesize_approx"),
-        "has_audio": item.get("acodec") not in {None, "none"},
-        "has_video": item.get("vcodec") not in {None, "none"},
+        "filesize_bytes": filesize_bytes,
+        "filesize_is_approximate": filesize_source != "exact",
+        "filesize_source": filesize_source,
+        "has_audio": has_audio,
+        "has_video": has_video,
+        "kind": "video+audio" if has_video and has_audio else "video" if has_video else "audio",
         "video_codec": None if item.get("vcodec") in {None, "none"} else item.get("vcodec"),
         "audio_codec": None if item.get("acodec") in {None, "none"} else item.get("acodec"),
         "needs_merge": item.get("vcodec") not in {None, "none"} and item.get("acodec") in {None, "none"},
@@ -129,18 +201,27 @@ def analyze_url(url: str) -> dict[str, Any]:
     direct = direct_format(url)
     if direct:
         return {"source": hostname, "title": None, "duration_seconds": None, "thumbnail_url": None, "drm_status": "unknown", "download_supported": True, "formats": [direct], "default_format_id": direct["format_id"]}
-    options = {"quiet": True, "no_warnings": True, "noplaylist": True, "skip_download": True, "socket_timeout": 20, "extractor_args": {}}
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "skip_download": True,
+        "socket_timeout": 20,
+        "retries": 3,
+        "fragment_retries": 3,
+        "extractor_retries": 2,
+        "extractor_args": {},
+    }
     try:
         with yt_dlp.YoutubeDL(options) as downloader:
             info = downloader.extract_info(url, download=False)
     except yt_dlp.utils.DownloadError as exc:
-        message = str(exc)
-        if "DRM" in message.upper() or "protected" in message.lower():
-            raise HTTPException(status_code=422, detail="This media appears to be DRM-protected and cannot be downloaded by Fetchly.") from exc
-        raise HTTPException(status_code=422, detail="The source could not be analyzed. It may be private, restricted, unavailable, or unsupported.") from exc
+        raise HTTPException(status_code=422, detail=extractor_error_message(exc)) from exc
     entries = info.get("entries") if info.get("_type") == "playlist" else [info]
     item = next((entry for entry in entries if entry), info)
-    formats = [format_info(item_format) for item_format in item.get("formats", []) if item_format.get("vcodec") not in {None, "none"} or item_format.get("acodec") not in {None, "none"}]
+    validate_extracted_urls(item)
+    duration = item.get("duration")
+    formats = [format_info(item_format, duration) for item_format in item.get("formats", []) if item_format.get("vcodec") not in {None, "none"} or item_format.get("acodec") not in {None, "none"}]
     formats = [item_format for item_format in formats if item_format["format_id"]]
     if not formats:
         raise HTTPException(status_code=422, detail="No downloadable formats were reported by this source.")
@@ -219,7 +300,21 @@ def download_with_ytdlp(job_id: str, url: str, format_id: str, title: str | None
         if selected["needs_merge"]:
             selected_expression = f"{format_id}+bestaudio/best"
         output_template = str(temp_dir / "%(title).180B [%(id)s].%(ext)s")
-        options: dict[str, Any] = {"format": selected_expression, "outtmpl": output_template, "noplaylist": True, "quiet": True, "no_warnings": True, "progress_hooks": [lambda hook: progress_hook(job_id, hook)], "merge_output_format": selected["container"] if selected["container"] in {"mp4", "webm", "mkv"} else "mp4", "restrictfilenames": True, "socket_timeout": 30, "max_filesize": MAX_DOWNLOAD_BYTES}
+        options: dict[str, Any] = {
+            "format": selected_expression,
+            "outtmpl": output_template,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "progress_hooks": [lambda hook: progress_hook(job_id, hook)],
+            "merge_output_format": selected["container"] if selected["container"] in {"mp4", "webm", "mkv"} else "mp4",
+            "restrictfilenames": True,
+            "socket_timeout": 30,
+            "retries": 3,
+            "fragment_retries": 3,
+            "extractor_retries": 2,
+            "max_filesize": MAX_DOWNLOAD_BYTES,
+        }
         if shutil.which("ffmpeg") is None and selected["needs_merge"]:
             raise RuntimeError("FFmpeg is required to combine this video's separate audio and video streams. Install FFmpeg and add it to PATH.")
         with yt_dlp.YoutubeDL(options) as downloader:
@@ -238,7 +333,7 @@ def download_with_ytdlp(job_id: str, url: str, format_id: str, title: str | None
     except JobCancelled:
         update_job(job_id, status="cancelled", error_code="cancelled")
     except yt_dlp.utils.DownloadError as exc:
-        update_job(job_id, status="failed", error_code="download_failed", error_message="The source could not be downloaded. It may be unavailable, restricted, or unsupported.")
+        update_job(job_id, status="failed", error_code="download_failed", error_message=extractor_error_message(exc))
     except Exception as exc:
         update_job(job_id, status="failed", error_code="download_failed", error_message=str(exc) if "FFmpeg" in str(exc) else "The download could not be completed.")
     finally:
